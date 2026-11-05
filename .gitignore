@@ -1,0 +1,17 @@
+# Sekretne klucze i środowisko
+.env
+.venv/
+venv/
+
+# Skompilowane pliki Pythona
+__pycache__/
+*.py[cod]
+
+# Lokalna baza danych SQLite i pliki tymczasowe WAL
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Eksporty i cache Streamlit
+*.csv
+.streamlit/

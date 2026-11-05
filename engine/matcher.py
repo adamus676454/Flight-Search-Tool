@@ -1,0 +1,162 @@
+"""
+engine/matcher.py – SQL-based matcher that JOINs outbound and inbound one-way
+                    flight legs from SQLite into combined round-trip offers.
+
+Matching rules:
+  1. dest_metro_group(outbound) == orig_metro_group(inbound)
+     E.g. land at FCO, return from CIA (both ROME) ✓
+          land at CTA, return from CIY (both SICILY_EAST) ✓
+          land at BGY, return from FCO ✗ (MILAN ≠ ROME)
+
+  2. Return airport in Poland:
+     a) Same airport:  out.orig_airport == ret.dest_airport
+     b) Flexible (checkbox): ret.dest_airport IN (user's origin group)
+
+  3. Nights = julianday(ret.flight_date) - julianday(out.flight_date)
+     must be between min_nights and max_nights (inclusive).
+
+  4. Both legs must have currency = 'EUR'.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+
+def match_roundtrips(
+    conn: sqlite3.Connection,
+    origin_airports: list[str],
+    min_nights: int = 2,
+    max_nights: int = 14,
+    allow_different_return_airport: bool = False,
+    max_price_eur: float | None = None,
+    direct_only: bool = False,
+    airlines_filter: list[str] | None = None,
+    query_hashes_outbound: list[str] | None = None,
+    query_hashes_inbound: list[str] | None = None,
+) -> list[dict]:
+    """Run the SQL JOIN matcher and return combined round-trip results.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+    origin_airports : list[str]
+        The set of origin airports the user selected (e.g. ["KRK", "KTW"]).
+    min_nights, max_nights : int
+        Acceptable stay length in nights.
+    allow_different_return_airport : bool
+        If True, the return can land at any airport in *origin_airports*.
+        If False, return must land at the same airport the outbound departed from.
+    max_price_eur : float | None
+        Total price cap (outbound + inbound).
+    direct_only : bool
+        If True, both legs must have stops = 0.
+    airlines_filter : list[str] | None
+        If set, at least one leg must match one of these airline names (substring).
+    query_hashes_outbound / query_hashes_inbound : list[str] | None
+        Restrict matching to specific cached queries.
+    """
+
+    # Build WHERE fragments
+    conditions_out = ["o.direction = 'outbound'", "o.currency = 'EUR'"]
+    conditions_ret = ["r.direction = 'inbound'", "r.currency = 'EUR'"]
+    params: list = []
+
+    # Origin airports for outbound
+    placeholders_orig = ",".join("?" for _ in origin_airports)
+    conditions_out.append(f"o.orig_airport IN ({placeholders_orig})")
+    params.extend(origin_airports)
+
+    # Return destination
+    if allow_different_return_airport:
+        conditions_ret.append(f"r.dest_airport IN ({placeholders_orig})")
+        params.extend(origin_airports)
+    # else: handled via JOIN condition (o.orig_airport = r.dest_airport)
+
+    # Direct only
+    if direct_only:
+        conditions_out.append("o.stops = 0")
+        conditions_ret.append("r.stops = 0")
+
+    # Query hash filters
+    if query_hashes_outbound:
+        ph = ",".join("?" for _ in query_hashes_outbound)
+        conditions_out.append(f"o.query_hash IN ({ph})")
+        params.extend(query_hashes_outbound)
+
+    if query_hashes_inbound:
+        ph = ",".join("?" for _ in query_hashes_inbound)
+        conditions_ret.append(f"r.query_hash IN ({ph})")
+        params.extend(query_hashes_inbound)
+
+    # Nights & price
+    params.extend([min_nights, max_nights])
+
+    origin_join = (
+        ""  # flexible: already filtered in WHERE
+        if allow_different_return_airport
+        else "AND o.orig_airport = r.dest_airport"
+    )
+
+    sql = f"""
+        SELECT
+            o.price_eur + r.price_eur                     AS total_eur,
+            o.price_eur                                    AS price_out_eur,
+            r.price_eur                                    AS price_ret_eur,
+            o.orig_airport                                 AS out_orig,
+            o.dest_airport                                 AS out_dest,
+            o.flight_date                                  AS out_date,
+            o.departure_time                               AS out_dep_time,
+            o.arrival_time                                 AS out_arr_time,
+            o.airline                                      AS out_airline,
+            o.flight_no                                    AS out_flight_no,
+            o.stops                                        AS out_stops,
+            o.dest_metro_group                             AS out_dest_metro,
+            r.orig_airport                                 AS ret_orig,
+            r.dest_airport                                 AS ret_dest,
+            r.flight_date                                  AS ret_date,
+            r.departure_time                               AS ret_dep_time,
+            r.arrival_time                                 AS ret_arr_time,
+            r.airline                                      AS ret_airline,
+            r.flight_no                                    AS ret_flight_no,
+            r.stops                                        AS ret_stops,
+            r.orig_metro_group                             AS ret_orig_metro,
+            CAST(julianday(r.flight_date) - julianday(o.flight_date) AS INTEGER) AS nights,
+            o.is_mock OR r.is_mock                         AS is_mock,
+            o.provider                                     AS out_provider,
+            r.provider                                     AS ret_provider,
+            o.fetched_at                                   AS out_fetched_at,
+            r.fetched_at                                   AS ret_fetched_at
+        FROM flights o
+        JOIN flights r
+          ON  o.dest_metro_group = r.orig_metro_group
+          {origin_join}
+        WHERE {' AND '.join(conditions_out)}
+          AND {' AND '.join(conditions_ret)}
+          AND CAST(julianday(r.flight_date) - julianday(o.flight_date) AS INTEGER) >= ?
+          AND CAST(julianday(r.flight_date) - julianday(o.flight_date) AS INTEGER) <= ?
+        ORDER BY total_eur ASC
+        LIMIT 500
+    """
+
+    cur = conn.execute(sql, params)
+    columns = [desc[0] for desc in cur.description]
+    rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+
+    # Post-SQL filters (price, airlines)
+    if max_price_eur is not None:
+        rows = [r for r in rows if r["total_eur"] <= max_price_eur]
+
+    if airlines_filter:
+        lower_filters = [a.lower() for a in airlines_filter]
+        rows = [
+            r
+            for r in rows
+            if any(
+                af in (r.get("out_airline") or "").lower()
+                or af in (r.get("ret_airline") or "").lower()
+                for af in lower_filters
+            )
+        ]
+
+    return rows

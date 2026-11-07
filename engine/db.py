@@ -209,3 +209,133 @@ def clear_cache(conn: sqlite3.Connection):
     conn.execute("DELETE FROM flights")
     conn.execute("DELETE FROM query_cache")
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Subset & Range Coverage Optimization (Set Inclusion Cache)
+# ---------------------------------------------------------------------------
+def get_covered_kiwi_dates(
+    conn: sqlite3.Connection,
+    orig: str,
+    dest: str,
+    req_nmin: int,
+    req_nmax: int,
+    ttl_hours: int = 24,
+    is_mock: bool = False,
+) -> set[str]:
+    """Zwraca zbiór dat YYYY-MM-DD, które są już pokryte w ważnym cache dla danej trasy Kiwi."""
+    cur = conn.execute(
+        "SELECT params_json, fetched_at FROM query_cache WHERE provider = ? AND is_mock = ?",
+        ("mock" if is_mock else "kiwi_mcp", 1 if is_mock else 0),
+    )
+    now_utc = datetime.now(timezone.utc)
+    covered: set[str] = set()
+
+    for params_str, fetched_str in cur.fetchall():
+        try:
+            fetched_dt = datetime.fromisoformat(fetched_str)
+            if fetched_dt.tzinfo is None:
+                fetched_dt = fetched_dt.replace(tzinfo=timezone.utc)
+            if now_utc - fetched_dt >= timedelta(hours=ttl_hours):
+                continue
+            p = json.loads(params_str)
+            if p.get("flyFrom") != orig or p.get("flyTo") != dest:
+                continue
+            c_nmin = int(p.get("nmin", 1))
+            c_nmax = int(p.get("nmax", 14))
+            # Pokrycie nocy: zapisany zakres nocy musi pokrywać lub być równy żądanemu
+            if c_nmin > req_nmin or c_nmax < req_nmax:
+                continue
+            d_from = datetime.strptime(p["date_from"], "%Y-%m-%d").date()
+            d_to = datetime.strptime(p["date_to"], "%Y-%m-%d").date()
+            curr = d_from
+            while curr <= d_to:
+                covered.add(curr.strftime("%Y-%m-%d"))
+                curr += timedelta(days=1)
+        except Exception:
+            continue
+    return covered
+
+
+def compute_uncovered_kiwi_range(
+    conn: sqlite3.Connection,
+    orig: str,
+    dest: str,
+    date_from: str,
+    date_to: str,
+    nmin: int,
+    nmax: int,
+    ttl_hours: int = 24,
+    is_mock: bool = False,
+) -> tuple[str, str] | None:
+    """
+    Oblicza z różnicy zbiorów, o jaki podprzedział dat trzeba jeszcze dopytać Kiwi MCP.
+    - Jeśli cały przedział [date_from, date_to] jest już w cache -> zwraca None (0 zapytań!).
+    - Jeśli brakuje tylko części (np. 5-7 lutego jest w cache, a szukamy 5-8 lutego) ->
+      zwraca ("2027-02-08", "2027-02-08").
+    """
+    covered = get_covered_kiwi_dates(conn, orig, dest, nmin, nmax, ttl_hours, is_mock)
+    d1 = datetime.strptime(date_from, "%Y-%m-%d").date()
+    d2 = datetime.strptime(date_to, "%Y-%m-%d").date()
+    req_dates: list[str] = []
+    curr = d1
+    while curr <= d2:
+        req_dates.append(curr.strftime("%Y-%m-%d"))
+        curr += timedelta(days=1)
+
+    missing = [d for d in req_dates if d not in covered]
+    if not missing:
+        return None
+    return (min(missing), max(missing))
+
+
+def query_flights_by_criteria(
+    conn: sqlite3.Connection,
+    origins: list[str],
+    dests: list[str],
+    direction: str | None = None,
+    provider: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    is_mock: bool | None = None,
+) -> list[dict]:
+    """Pobiera loty z tabeli flights po lotniskach i zakresie dat (rozpakowując raw_json)."""
+    if not origins or not dests:
+        return []
+    orig_ph = ",".join("?" for _ in origins)
+    dest_ph = ",".join("?" for _ in dests)
+    conds = [f"orig_airport IN ({orig_ph})", f"dest_airport IN ({dest_ph})"]
+    params: list = [*origins, *dests]
+
+    if direction:
+        conds.append("direction = ?")
+        params.append(direction)
+    if provider:
+        conds.append("provider = ?")
+        params.append(provider)
+    if date_from:
+        conds.append("flight_date >= ?")
+        params.append(date_from)
+    if date_to:
+        conds.append("flight_date <= ?")
+        params.append(date_to)
+    if is_mock is not None:
+        conds.append("is_mock = ?")
+        params.append(1 if is_mock else 0)
+
+    sql = f"SELECT * FROM flights WHERE {' AND '.join(conds)} ORDER BY price_eur ASC"
+    cur = conn.execute(sql, params)
+    columns = [desc[0] for desc in cur.description]
+    results = []
+    for row in cur.fetchall():
+        row_dict = dict(zip(columns, row))
+        raw_val = row_dict.get("raw_json")
+        if raw_val:
+            try:
+                extra = json.loads(raw_val)
+                if isinstance(extra, dict):
+                    row_dict = {**row_dict, **extra}
+            except Exception:
+                pass
+        results.append(row_dict)
+    return results

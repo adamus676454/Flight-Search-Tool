@@ -1,17 +1,18 @@
-# Sekretne klucze i środowisko
+# Secret keys and virtual environments
 .env
 .venv/
 venv/
+.streamlit/secrets.toml
 
-# Skompilowane pliki Pythona
+# Byte-compiled / cache files
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
-# Lokalna baza danych SQLite i pliki tymczasowe WAL
+# Local SQLite database and WAL temporary files
 data/*.db
 data/*.db-shm
 data/*.db-wal
 
-# Eksporty i cache Streamlit
+# Local CSV exports
 *.csv
-.streamlit/

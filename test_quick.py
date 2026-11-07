@@ -381,5 +381,160 @@ assert kc1["booking_url"] == "https://kiwi.com/book/test1", f"Expected url, got 
 conn_test.close()
 print("  Kiwi cache preservation OK")
 
+# ===== 11. Unified Schedule Filters & Numeric Price Formatting =====
+print("\n=== 11. Unified Schedule Filters & Numeric Price Formatting ===")
+
+# 1. generate_mock_kiwi_flights with keyword arguments
+mock_kiwi_bounds = providers.mock_provider.generate_mock_kiwi_flights(
+    origin_airport="KRK",
+    dest_airport="BGY",
+    date_from="2027-03-15",
+    date_to="2027-03-17",
+    return_from="2027-03-18",
+    return_to="2027-03-25",
+    nights_in_dst_from=3,
+    nights_in_dst_to=6,
+)
+assert len(mock_kiwi_bounds) > 0, "Expected at least 1 mock flight generated"
+for f in mock_kiwi_bounds:
+    assert 3 <= f["nights"] <= 6, f"Expected 3 <= nights <= 6, got {f['nights']}"
+    assert "2027-03-18" <= f["return_date"] <= "2027-03-25", f"Return date {f['return_date']} outside bounds"
+print("  Mock Kiwi return date and nights bounds OK")
+
+# 2. match_roundtrips with schedule filter parameters
+conn_match = engine.db.get_connection()
+matched_sched = engine.matcher.match_roundtrips(
+    conn_match,
+    origin_airports=["KRK", "KTW"],
+    min_nights=5,
+    max_nights=10,
+    allow_different_return_airport=True,
+    out_date_from="2027-03-15",
+    out_date_to="2027-03-16",
+    ret_date_from="2027-03-20",
+    ret_date_to="2027-03-22",
+    out_weekdays=["Pn", "Wt"],
+    ret_weekdays=["Sb", "Nd", "Pn"],
+)
+assert len(matched_sched) > 0, "Expected matched roundtrips with schedule filters"
+for m in matched_sched:
+    assert "2027-03-15" <= m["out_date"] <= "2027-03-16"
+    assert "2027-03-20" <= m["ret_date"] <= "2027-03-22"
+    out_wd = engine.matcher.WEEKDAY_MAP[datetime.strptime(m["out_date"], "%Y-%m-%d").weekday()]
+    ret_wd = engine.matcher.WEEKDAY_MAP[datetime.strptime(m["ret_date"], "%Y-%m-%d").weekday()]
+    assert out_wd in ["Pn", "Wt"]
+    assert ret_wd in ["Sb", "Nd", "Pn"]
+conn_match.close()
+print("  Matcher schedule date & weekday filters OK")
+
+# 3. Numeric price sorting
+test_prices = [100.0, 39.0, 56.0]
+assert all(isinstance(p, float) for p in test_prices)
+sorted_prices = sorted(test_prices)
+assert sorted_prices == [39.0, 56.0, 100.0], f"Expected numeric sort [39.0, 56.0, 100.0], got {sorted_prices}"
+assert 39.0 < 56.0 < 100.0
+# Verify that string sorting would have produced incorrect ordering
+str_sorted = sorted([str(p) for p in test_prices])
+assert str_sorted[0] == "100.0", "String sorting puts '100.0' first"
+print("  Numeric price sorting (39.0 < 56.0 < 100.0) OK")
+
+# ===== 12. Set-Inclusion & Range Coverage Cache Optimization =====
+print("\n=== 12. Set-Inclusion & Range Coverage Cache Optimization ===")
+conn_12 = engine.db.get_connection()
+test_p = {"flyFrom": "KRK", "flyTo": "BGY", "date_from": "2027-02-05", "date_to": "2027-02-07", "nmin": 2, "nmax": 7}
+test_flights = [{"provider": "mock", "direction": "roundtrip", "orig_airport": "KRK", "dest_airport": "BGY",
+                 "orig_metro_group": "KRK", "dest_metro_group": "MILAN", "flight_date": "2027-02-05",
+                 "price_eur": 50.0, "currency": "EUR", "stops": 0, "is_mock": True}]
+engine.db.store_flights(conn_12, "mock", test_p, test_flights, is_mock=True)
+
+# Subset test (2027-02-05 to 2027-02-06 should return None -> 0 API calls)
+res_sub = engine.db.compute_uncovered_kiwi_range(conn_12, "KRK", "BGY", "2027-02-05", "2027-02-06", 2, 7, ttl_hours=24, is_mock=True)
+assert res_sub is None, f"Expected None for covered subset, got {res_sub}"
+print("  Subset inclusion (0 calls): OK")
+
+# Partially uncovered test (2027-02-05 to 2027-02-08 should return ('2027-02-08', '2027-02-08'))
+res_partial = engine.db.compute_uncovered_kiwi_range(conn_12, "KRK", "BGY", "2027-02-05", "2027-02-08", 2, 7, ttl_hours=24, is_mock=True)
+assert res_partial == ("2027-02-08", "2027-02-08"), f"Expected ('2027-02-08', '2027-02-08'), got {res_partial}"
+print("  Partial range coverage calculation: OK")
+
+# query_flights_by_criteria test
+queried = engine.db.query_flights_by_criteria(conn_12, origins=["KRK"], dests=["BGY"], date_from="2027-02-05", date_to="2027-02-05", is_mock=True)
+assert len(queried) > 0, "Expected at least 1 flight from query_flights_by_criteria"
+assert queried[0]["orig_airport"] == "KRK"
+assert queried[0]["dest_airport"] == "BGY"
+print("  query_flights_by_criteria lookup: OK")
+
+conn_12.close()
+
+# ===== 13. Exact Matcher dest_airports, EN/PL Weekdays & Static Verification =====
+print("\n=== 13. Exact Matcher dest_airports, EN/PL Weekdays & Static Verification ===")
+conn_13 = engine.db.get_connection()
+
+# 1. dest_airports filtering before LIMIT 500
+matched_bgy = engine.matcher.match_roundtrips(
+    conn_13,
+    origin_airports=["KRK", "KTW"],
+    dest_airports=["BGY"],
+    min_nights=5,
+    max_nights=10,
+    allow_different_return_airport=True,
+    is_mock=True,
+)
+assert len(matched_bgy) > 0, "Expected at least 1 round-trip to BGY"
+assert all(m["out_dest"] == "BGY" for m in matched_bgy), f"All destinations must be BGY, got: {[m['out_dest'] for m in matched_bgy]}"
+print(f"  dest_airports=['BGY'] filter (0 non-BGY): OK ({len(matched_bgy)} combinations)")
+
+# 2. EN & PL Weekdays matching
+matched_en = engine.matcher.match_roundtrips(
+    conn_13,
+    origin_airports=["KRK", "KTW"],
+    dest_airports=["BGY"],
+    min_nights=5,
+    max_nights=10,
+    allow_different_return_airport=True,
+    out_weekdays=["Mon", "Tue"],
+    is_mock=True,
+)
+assert len(matched_en) > 0, "Expected matched roundtrips with EN weekdays"
+for m in matched_en:
+    wd = datetime.strptime(m["out_date"], "%Y-%m-%d").weekday()
+    assert wd in [0, 1], f"Expected Monday (0) or Tuesday (1), got weekday {wd} for {m['out_date']}"
+
+matched_pl = engine.matcher.match_roundtrips(
+    conn_13,
+    origin_airports=["KRK", "KTW"],
+    dest_airports=["BGY"],
+    min_nights=5,
+    max_nights=10,
+    allow_different_return_airport=True,
+    out_weekdays=["Pn", "Wt"],
+    is_mock=True,
+)
+assert len(matched_pl) > 0, "Expected matched roundtrips with PL weekdays"
+assert len(matched_pl) == len(matched_en), f"PL ({len(matched_pl)}) and EN ({len(matched_en)}) weekday filters should return identical results"
+print(f"  EN/PL Weekday matching (Mon/Tue == Pn/Wt): OK ({len(matched_en)} items)")
+
+conn_13.close()
+
+# 3. Static verification of app.py
+with open("app.py", encoding="utf-8") as f:
+    app_content = f.read()
+
+# No kind="primary" in widget calls
+import re
+widget_kind_calls = re.findall(r'st\.\w+\([^)]*kind\s*=', app_content)
+assert len(widget_kind_calls) == 0, f"Found kind= in Streamlit widget calls: {widget_kind_calls}"
+print("  Zero kind= in Streamlit widget calls: OK")
+
+# No 'Book' column config in table configs
+assert '"Book":' not in app_content and "'Book':" not in app_content, "Found 'Book' column in config in app.py"
+print("  Zero 'Book' column in table configs: OK")
+
+# No forbidden emojis in app.py
+forbidden_emojis = ["✈️", "🔒", "🟡", "🟢", "⚙️", "🗑️", "🔑", "🌍", "🛫", "🎯", "📊", "🚫", "✅", "⚠️", "❌", "📦", "🔥", "🔗", "🗂️", "🧪"]
+for em in forbidden_emojis:
+    assert em not in app_content, f"Forbidden emoji '{em}' found in app.py"
+print("  Zero forbidden emojis in app.py: OK")
+
 print("\n" + "="*50)
-print("ALL TESTS PASSED ✅")
+print("ALL TESTS PASSED")

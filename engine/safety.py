@@ -2,7 +2,7 @@
 engine/safety.py – Backend Circuit Breaker & API-budget guard.
 
 Rules enforced:
-  1. HARD_MAX_CALLS_PER_SEARCH = 5  (UI can lower, never raise)
+  1. HARD_MAX_CALLS_PER_SEARCH = 12  (UI can lower, never raise)
   2. max_retries = 0  (no automatic retries on HTTP errors)
   3. Pre-flight /account check for SerpApi remaining quota
   4. Concurrent-search lock via st.session_state (checked at call-site in app.py)
@@ -21,7 +21,7 @@ import requests as _requests  # only used when MOCK_MODE is False
 # ---------------------------------------------------------------------------
 # Hard limits (cannot be overridden by the UI)
 # ---------------------------------------------------------------------------
-HARD_MAX_CALLS_PER_SEARCH = 5
+HARD_MAX_CALLS_PER_SEARCH = 12
 MAX_RETRIES = 0  # never retry
 
 # ---------------------------------------------------------------------------

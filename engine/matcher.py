@@ -21,6 +21,13 @@ Matching rules:
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
+
+WEEKDAY_MAP = {0: "Pn", 1: "Wt", 2: "Śr", 3: "Cz", 4: "Pt", 5: "Sb", 6: "Nd"}
+WEEKDAY_INDEX_MAP = {
+    "Pn": 0, "Wt": 1, "Śr": 2, "Cz": 3, "Pt": 4, "Sb": 5, "Nd": 6,
+    "Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6,
+}
 
 
 def match_roundtrips(
@@ -34,6 +41,14 @@ def match_roundtrips(
     airlines_filter: list[str] | None = None,
     query_hashes_outbound: list[str] | None = None,
     query_hashes_inbound: list[str] | None = None,
+    out_date_from: str | None = None,
+    out_date_to: str | None = None,
+    ret_date_from: str | None = None,
+    ret_date_to: str | None = None,
+    out_weekdays: list[str] | None = None,
+    ret_weekdays: list[str] | None = None,
+    dest_airports: list[str] | None = None,
+    is_mock: bool | None = None,
 ) -> list[dict]:
     """Run the SQL JOIN matcher and return combined round-trip results.
 
@@ -57,20 +72,21 @@ def match_roundtrips(
         Restrict matching to specific cached queries.
     """
 
-    # Build WHERE fragments
+    # Build WHERE fragments with isolated parameter lists
     conditions_out = ["o.direction = 'outbound'", "o.currency = 'EUR'"]
     conditions_ret = ["r.direction = 'inbound'", "r.currency = 'EUR'"]
-    params: list = []
+    params_out: list = []
+    params_ret: list = []
 
     # Origin airports for outbound
     placeholders_orig = ",".join("?" for _ in origin_airports)
     conditions_out.append(f"o.orig_airport IN ({placeholders_orig})")
-    params.extend(origin_airports)
+    params_out.extend(origin_airports)
 
     # Return destination
     if allow_different_return_airport:
         conditions_ret.append(f"r.dest_airport IN ({placeholders_orig})")
-        params.extend(origin_airports)
+        params_ret.extend(origin_airports)
     # else: handled via JOIN condition (o.orig_airport = r.dest_airport)
 
     # Direct only
@@ -82,15 +98,45 @@ def match_roundtrips(
     if query_hashes_outbound:
         ph = ",".join("?" for _ in query_hashes_outbound)
         conditions_out.append(f"o.query_hash IN ({ph})")
-        params.extend(query_hashes_outbound)
+        params_out.extend(query_hashes_outbound)
 
     if query_hashes_inbound:
         ph = ",".join("?" for _ in query_hashes_inbound)
         conditions_ret.append(f"r.query_hash IN ({ph})")
-        params.extend(query_hashes_inbound)
+        params_ret.extend(query_hashes_inbound)
 
-    # Nights & price
-    params.extend([min_nights, max_nights])
+    # Destination airports filter in SQL (applied before LIMIT 500)
+    if dest_airports:
+        ph_dest = ",".join("?" for _ in dest_airports)
+        conditions_out.append(f"o.dest_airport IN ({ph_dest})")
+        params_out.extend(dest_airports)
+        conditions_ret.append(f"r.orig_airport IN ({ph_dest})")
+        params_ret.extend(dest_airports)
+
+    # Date range filters in SQL (applied before LIMIT 500)
+    if out_date_from:
+        conditions_out.append("o.flight_date >= ?")
+        params_out.append(out_date_from)
+    if out_date_to:
+        conditions_out.append("o.flight_date <= ?")
+        params_out.append(out_date_to)
+    if ret_date_from:
+        conditions_ret.append("r.flight_date >= ?")
+        params_ret.append(ret_date_from)
+    if ret_date_to:
+        conditions_ret.append("r.flight_date <= ?")
+        params_ret.append(ret_date_to)
+
+    # Mock mode filter in SQL (applied before LIMIT 500)
+    if is_mock is not None:
+        conditions_out.append("o.is_mock = ?")
+        params_out.append(1 if is_mock else 0)
+        conditions_ret.append("r.is_mock = ?")
+        params_ret.append(1 if is_mock else 0)
+
+    # Combine params strictly in the order of SQL placeholders:
+    # 1. conditions_out params, 2. conditions_ret params, 3. min_nights, 4. max_nights
+    params = params_out + params_ret + [min_nights, max_nights]
 
     origin_join = (
         ""  # flexible: already filtered in WHERE
@@ -143,10 +189,36 @@ def match_roundtrips(
     columns = [desc[0] for desc in cur.description]
     rows = [dict(zip(columns, row)) for row in cur.fetchall()]
 
-    # Post-SQL filters (price, airlines)
+    # Post-SQL filters: Weekdays (supporting both PL and EN weekday names)
+    if out_weekdays:
+        allowed_out = {WEEKDAY_INDEX_MAP[wd] for wd in out_weekdays if wd in WEEKDAY_INDEX_MAP}
+        valid_rows = []
+        for r in rows:
+            try:
+                wd_idx = datetime.strptime(r["out_date"], "%Y-%m-%d").weekday()
+                if wd_idx in allowed_out:
+                    valid_rows.append(r)
+            except (ValueError, TypeError):
+                valid_rows.append(r)
+        rows = valid_rows
+
+    if ret_weekdays:
+        allowed_ret = {WEEKDAY_INDEX_MAP[wd] for wd in ret_weekdays if wd in WEEKDAY_INDEX_MAP}
+        valid_rows = []
+        for r in rows:
+            try:
+                wd_idx = datetime.strptime(r["ret_date"], "%Y-%m-%d").weekday()
+                if wd_idx in allowed_ret:
+                    valid_rows.append(r)
+            except (ValueError, TypeError):
+                valid_rows.append(r)
+        rows = valid_rows
+
+    # Post-SQL filters: Price cap
     if max_price_eur is not None:
         rows = [r for r in rows if r["total_eur"] <= max_price_eur]
 
+    # Post-SQL filters: Airlines
     if airlines_filter:
         lower_filters = [a.lower() for a in airlines_filter]
         rows = [

@@ -195,18 +195,65 @@ def generate_mock_kiwi_flights(
     nights_in_dst_from: int = 2,
     nights_in_dst_to: int = 14,
 ) -> list[dict]:
-    """Generate mock Kiwi-style round-trip offers."""
-    rng = random.Random(hash(f"{origin_airport}{dest_airport}{date_from}"))
+    """Generate mock Kiwi-style round-trip offers respecting date and night bounds."""
+    seed_val = sum(c * (idx + 1) for idx, c in enumerate(f"{origin_airport}{dest_airport}{date_from}".encode()))
+    rng = random.Random(seed_val)
 
     mock_airlines = ["Ryanair", "Wizz Air", "easyJet", "Vueling"]
     results = []
 
-    base_date = datetime.strptime(date_from, "%Y-%m-%d")
-    for i in range(rng.randint(2, 6)):
-        offset = rng.randint(0, 6)
-        out_date = (base_date + timedelta(days=offset)).strftime("%Y-%m-%d")
-        nights = rng.randint(nights_in_dst_from, nights_in_dst_to)
-        ret_date = (base_date + timedelta(days=offset + nights)).strftime("%Y-%m-%d")
+    d_from = datetime.strptime(date_from, "%Y-%m-%d")
+    try:
+        d_to = datetime.strptime(date_to, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        d_to = d_from
+    if d_to < d_from:
+        d_to = d_from
+
+    ret_from_dt = None
+    if return_from:
+        try:
+            ret_from_dt = datetime.strptime(return_from, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            pass
+
+    ret_to_dt = None
+    if return_to:
+        try:
+            ret_to_dt = datetime.strptime(return_to, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            pass
+
+    max_out_offset = (d_to - d_from).days
+    num_offers = rng.randint(2, 6)
+
+    for i in range(num_offers):
+        offset = rng.randint(0, max_out_offset) if max_out_offset > 0 else 0
+        out_dt = d_from + timedelta(days=offset)
+
+        min_n = max(0, nights_in_dst_from)
+        max_n = max(min_n, nights_in_dst_to)
+
+        if ret_from_dt is not None:
+            min_n = max(min_n, (ret_from_dt - out_dt).days)
+        if ret_to_dt is not None:
+            max_n = min(max_n, (ret_to_dt - out_dt).days)
+
+        if max_n < min_n:
+            if nights_in_dst_to >= nights_in_dst_from:
+                min_n = max(0, nights_in_dst_from)
+                max_n = max(min_n, nights_in_dst_to)
+            else:
+                max_n = max(0, min_n)
+
+        min_n = max(0, min_n)
+        max_n = max(min_n, max_n)
+        nights = rng.randint(min_n, max_n)
+        ret_dt = out_dt + timedelta(days=nights)
+
+        out_date = out_dt.strftime("%Y-%m-%d")
+        ret_date = ret_dt.strftime("%Y-%m-%d")
+
         price_out = round(rng.uniform(15.0, 80.0), 2)
         price_ret = round(rng.uniform(15.0, 80.0), 2)
         airline = rng.choice(mock_airlines)
